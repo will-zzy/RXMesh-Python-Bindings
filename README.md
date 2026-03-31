@@ -2,7 +2,7 @@
 
 A lightweight PyTorch extension that wraps **[RXMesh](https://github.com/owensgroup/RXMesh)** and exposes mesh topology, attributes, and several custom CUDA kernels to Python.
 
-Thanks @Ahdhn for your help!
+Thanks @ Ahdhn for your help!
 
 This project is intended for workflows where:
 
