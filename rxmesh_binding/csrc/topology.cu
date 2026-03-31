@@ -13,13 +13,13 @@ int is_done(const rxmesh::RXMeshDynamic*             rx,
 {
     using namespace rxmesh;
 
-    // if there is at least one edge that is ADDED or SKIP, then we are not done yet
+    // if there is at least one edge that is TO_SPLIT or SKIP, then we are not done yet
     CUDA_ERROR(cudaMemset(d_buffer, 0, sizeof(int)));
 
     rx->for_each_edge(
         rxmesh::DEVICE,
         [edge_status = *edge_status, d_buffer] __device__(const EdgeHandle eh) {
-            if (edge_status(eh) == TO_SPLIT) {
+            if (edge_status(eh) == TO_SPLIT || edge_status(eh) == SKIP) {
                 ::atomicAdd(d_buffer, 1);
             }
         });
@@ -100,6 +100,10 @@ __global__ void face_subdivide_split(
     is_updated.reset(block); 
     // 用来记录新增的边并更新status，避免在迭代之间触发旧边的status造成新增边重复split
 
+    Bitmask is_flipped(cavity.patch_info().edges_capacity, shrd_alloc);
+    is_flipped.reset(block);
+    // 表示这一轮updated的边中应该flip的edge
+    // 如果不flip的话，需要将edge_flip设置为false
     uint32_t shmem_before = shrd_alloc.get_allocated_size_bytes();
 
     Query<blockThreads> query(context, cavity.patch_id());
@@ -138,9 +142,6 @@ __global__ void face_subdivide_split(
             // 3 = other side opposite vertex (may be invalid)
             const VertexHandle v0 = cavity.get_cavity_vertex(c, 0);
             const VertexHandle v1 = cavity.get_cavity_vertex(c, 2);
-            // printf("v0_pos: (%f, %f, %f), v1_pos: (%f, %f, %f)\n"
-            //        , coords(v0, 0), coords(v0, 1), coords(v0, 2)
-            //        , coords(v1, 0), coords(v1, 1), coords(v1, 2));
             const VertexHandle new_v = cavity.add_vertex();
             if (!new_v.is_valid()) {
                 return;
@@ -154,13 +155,11 @@ __global__ void face_subdivide_split(
             const DEdgeHandle e_init = e0;
 
             if (!e0.is_valid()) {
-                // printf("a!\n");
                 return;
             }
 
             is_updated.set(e0.local_id(), true);
-            // edge_status(e0.get_edge_handle()) = ADDED;
-
+            // edge_flip(e0.get_edge_handle()) = false;
             for (uint16_t i = 0; i < size; ++i) {
                 const DEdgeHandle e = cavity.get_cavity_edge(c, i);
                 const EdgeHandle eh = e.get_edge_handle();
@@ -172,29 +171,13 @@ __global__ void face_subdivide_split(
                         cavity.add_edge(cavity.get_cavity_vertex(c, i + 1), new_v);
 
                 if (!e1.is_valid()) {
-                    // printf("b!\n");
                     break;
                 }
-                // edge_status(e1.get_edge_handle()) = ADDED;
-                if (i != size - 1) {
-                    is_updated.set(e1.local_id(), true);
-                }
-                
+                is_updated.set(e1.local_id(), true);
+                // edge_flip(e1.get_edge_handle()) = false;
                 
                 const FaceHandle f = cavity.add_face(e0, e, e1);
                 if (!f.is_valid()) {
-                    
-                    const VertexHandle v00 = cavity.get_cavity_vertex(c, (i + 1) % size);
-                    const VertexHandle v11 = new_v;
-                    const VertexHandle v22 = cavity.get_cavity_vertex(c, i);
-                    printf("c! face vertex pos: %f, %f, %f\n"
-                    "%f, %f, %f\n"
-                    "%f, %f, %f\n"
-                    ,
-                    coords(v00, 0), coords(v00, 1), coords(v00, 2),
-                    coords(v11, 0), coords(v11, 1), coords(v11, 2),
-                    coords(v22, 0), coords(v22, 1), coords(v22, 2)
-                    );
                     break;
                 }
 
@@ -202,20 +185,8 @@ __global__ void face_subdivide_split(
                 // 没可能，因为相邻cavity是互斥的
                 // 如果两条边都是TO_SPLIT，且iteration对齐，那么新边就是diamond的对角线，需要flip
                 if (edge_status(eh) == TO_SPLIT && edge_status(eh_next) == TO_SPLIT && i % 2 == 0) {
-                    // flip = true; // If both adjacent edges of the diamond are original edges (TO_SPLIT), the new edge is a bad diagonal and needs to be flipped
-                    EdgeHandle eh_flip = e1.get_edge_handle();
-                    edge_flip(eh_flip) = true; 
-                    const VertexHandle v00 = cavity.get_cavity_vertex(c, i + 1);
-                    const VertexHandle v11 = new_v;
-                    if ((abs(coords(v00, 0)-3.0f) < 1e-2 && abs(coords(v00, 1)-4.0f) < 1e-2 && abs(coords(v11, 2)-2.0f) < 1e-2 && abs(coords(v11, 2)-3.5f) < 1e-2) || 
-                        (abs(coords(v11, 0)-3.0f) < 1e-2 && abs(coords(v11, 2)-4.0f) < 1e-2 && abs(coords(v00, 0)-2.0f) < 1e-2 && abs(coords(v00, 2)-3.5f) < 1e-2)
-                        ) {
-                        printf("flip edge vertex: %f, %f, %f\n"
-                            "%f, %f, %f\n"
-                            , coords(v00, 0), coords(v00, 1), coords(v00, 2)
-                            , coords(v11, 0), coords(v11, 1), coords(v11, 2)
-                        );
-                    }
+                    const EdgeHandle eh_flip = e1.get_edge_handle();
+                    is_flipped.set(eh_flip.local_id(), true);
                 }
                 
                 e0 = e1.get_flip_dedge();
@@ -230,9 +201,15 @@ __global__ void face_subdivide_split(
     block.sync();
     if (cavity.is_successful()) { // 如果所有的cavities都成功了，才更新
         for_each_edge(cavity.patch_info(), [&](EdgeHandle eh) {
-            if (is_updated(eh.local_id())) { // 记得原先的也要设为false
+            if (is_updated(eh.local_id())) { 
                 edge_status(eh) = ADDED;
+                if (is_flipped(eh.local_id())) {
+                    edge_flip(eh) = true;
+                } else {
+                    edge_flip(eh) = false;
+                }
             } 
+            
         });
 
     } 
@@ -306,99 +283,6 @@ __global__ void mark_split_edges_from_faces(
 }
 
 
-template <typename T, uint32_t blockThreads>
-__global__ void face_subdivide_flip(
-    rxmesh::Context                context,
-    rxmesh::VertexAttribute<T>     coords,
-    rxmesh::EdgeAttribute<EdgeStatus> edge_status,
-    rxmesh::EdgeAttribute<bool>  edge_flip,
-    int* d_buffer
-)
-{
-    using namespace rxmesh;
-
-    auto block = cooperative_groups::this_thread_block();
-    ShmemAllocator shrd_alloc;
-
-    CavityManager<blockThreads, CavityOp::E> cavity(
-        block, context, shrd_alloc, false, false);
-
-    if (cavity.patch_id() == INVALID32) {
-        return;
-    }
-
-    Bitmask is_updated(cavity.patch_info().edges_capacity, shrd_alloc);
-    is_updated.reset(block);
-    block.sync();
-    uint32_t shmem_before = shrd_alloc.get_allocated_size_bytes();
-
-    // uint16_t* v_info =
-    //     shrd_alloc.alloc<uint16_t>(2 * cavity.patch_info().num_vertices[0]);
-    // fill_n<blockThreads>(
-    //     v_info, 2 * cavity.patch_info().num_vertices[0], uint16_t(INVALID16));
-
-    // // a bitmask that indicates which edge we want to flip
-    // Bitmask e_flip(cavity.patch_info().num_edges[0], shrd_alloc);
-    // e_flip.reset(block);
-
-
-    Query<blockThreads> query(context, cavity.patch_id());
-    query.dispatch<Op::EVDiamond>(
-        block,
-        shrd_alloc,
-        [&](const EdgeHandle& eh, const VertexIterator& iter) {
-            const bool is_bdry = (!iter[1].is_valid() || !iter[3].is_valid());
-            // edge_boundary(eh) = is_bdry;
-
-            if (!is_bdry && edge_status(eh) == UNSEEN && edge_flip(eh) == true) {
-                cavity.create(eh);
-            }
-        });
-    block.sync();
-
-    shrd_alloc.dealloc(shrd_alloc.get_allocated_size_bytes() - shmem_before);
-
-    if (cavity.prologue(block, shrd_alloc, coords, edge_status, edge_flip)) {
-        cavity.for_each_cavity(block, [&](uint16_t c, uint16_t size) {
-            if (size != 4) {
-                return;
-            }
-            DEdgeHandle new_edge = cavity.add_edge(
-                cavity.get_cavity_vertex(c, 1), cavity.get_cavity_vertex(c, 3));
-
-
-            if (new_edge.is_valid()) {
-                is_updated.set(new_edge.local_id(), true);
-                edge_flip(new_edge.get_edge_handle()) = false; // don't flip the new edge
-                cavity.add_face(cavity.get_cavity_edge(c, 0),
-                                new_edge,
-                                cavity.get_cavity_edge(c, 3));
-
-
-                cavity.add_face(cavity.get_cavity_edge(c, 1),
-                                cavity.get_cavity_edge(c, 2),
-                                new_edge.get_flip_dedge());
-            }
-
-        });
-    }
-    cavity.epilogue(block);
-    block.sync();
-
-    for_each_edge(cavity.patch_info(), [&](EdgeHandle eh) {
-        if (is_updated(eh.local_id())) {
-            edge_status(eh) = ADDED;
-        } 
-        if (edge_flip(eh) == true) {
-            atomicAdd(d_buffer, 1);
-            //  printf("flip edge %u: %f, %f, %f -- %f, %f, %f\n", eh.local_id(),
-            //     coords(cavity.get_cavity_vertex(c, 0), 0), coords(cavity.get_cavity_vertex(c, 0), 1), coords(cavity.get_cavity_vertex(c, 0), 2),
-            //     coords(cavity.get_cavity_vertex(c, 2), 0), coords(cavity.get_cavity_vertex(c, 2), 1), coords(cavity.get_cavity_vertex(c, 2), 2));
-        }
-    });
-}
-
-
 
 void SplitEdges(RXMeshWrapper* wrapper)
 {
@@ -411,34 +295,24 @@ void SplitEdges(RXMeshWrapper* wrapper)
         std::dynamic_pointer_cast<FaceAttribute<bool>>(
             wrapper->m_attributes["f:b1:need_subdivide"]);
 
-    // wrapper->remove_attribute("v:b1:boundary", false);
     wrapper->remove_attribute("e:b1:boundary", false);
     wrapper->remove_attribute("e:c1:status", false);
     wrapper->remove_attribute("e:b1:flip", false);
 
-    // auto v_boundary    = rx->add_vertex_attribute<bool>("v:b1:boundary", 1);
     auto edge_boundary = rx->add_edge_attribute<bool>("e:b1:boundary", 1);
     auto edge_status   = rx->add_edge_attribute<EdgeStatus>("e:c1:status", 1);
     auto edge_flip     = rx->add_edge_attribute<bool>("e:b1:flip", 1);
 
-    // wrapper->m_attributes["v:b1:boundary"]      = v_boundary;
     wrapper->m_attributes["e:b1:flip"]      = edge_flip;
-    wrapper->m_attributes["e:c1:status"]      = edge_status;
     // wrapper->m_attributes["e:c1:status"]      = edge_status;
-    // v_boundary->reset(false, DEVICE);
     edge_boundary->reset(false, DEVICE);
     edge_status->reset(SKIP, DEVICE);
     edge_flip->reset(false, DEVICE);
-    // rx->get_boundary_vertices(*v_boundary);
-    // get_boundary_vertices(wrapper, *v_boundary);
     int* d_buffer;
     CUDA_ERROR(cudaMallocManaged((void**)&d_buffer, sizeof(int)));
 
-
-
     constexpr uint32_t blockThreads = 256;
 
-    // Pass 1: split all edges touched by red faces
     LaunchBox<blockThreads> lb_mark_bdry_edges;
     rx->update_launch_box(
         {Op::EF},
@@ -496,32 +370,21 @@ void SplitEdges(RXMeshWrapper* wrapper)
         false,
         false,
         false,
-        [&](uint32_t, uint32_t e, uint32_t) {
+        [&](uint32_t, uint32_t e, uint32_t) { // useless as dyn_mem is fixed to 80 * 1024 in update_launch_box
             return 4 * rxmesh::detail::mask_num_bytes(e) +
                 ShmemAllocator::default_alignment;
         });
     
-    // Debug: validate right after marking split edges, before any split
-    // rx->update_host();
-    // if (!rx->validate()) {
-    //     RXMESH_ERROR("Validation failed after mark_split_edges_from_faces");
-    // }
-    // printf("%d, %d, %d\n", lb_mark_bdry_edges.smem_bytes_dyn, lb_mark_edges.smem_bytes_dyn, lb_split.smem_bytes_dyn);
     constexpr int kMaxSplitPasses = 12;
-    // printf("blocks, %d, num_threads: %d\n", lb_split.blocks, lb_split.num_threads);
     for (int pass = 0; pass < kMaxSplitPasses; ++pass) {
         const uint32_t vertices_before = rx->get_num_vertices(true);
         rx->reset_scheduler();
         int inner_iter = 0;
         constexpr int kMaxInnerIter = 12;
-
-        // printf("[Subdivide] pass %d: vertices = %u\n", pass, vertices_before);
         while (!rx->is_queue_empty()) {
             if (++inner_iter > kMaxInnerIter) {
-                // printf("[Subdivide] stop inner loop at pass %d due to kMaxInnerIter=%d\n", pass, kMaxInnerIter);
                 break;
             }
-            // printf("[Subdivide] pass %d, inner iter %d\n", pass, inner_iter);
             face_subdivide_split<float, blockThreads>
                 <<<lb_split.blocks,
                    lb_split.num_threads,
@@ -531,61 +394,141 @@ void SplitEdges(RXMeshWrapper* wrapper)
                     *edge_status,
                     *edge_flip,
                     pass);
-            cudaDeviceSynchronize();
-            // printf("launch kernel done!\n");
             rx->cleanup();
-            cudaDeviceSynchronize();
-            // printf("launch first clean done!\n");
             rx->slice_patches(*coords, *edge_status, *edge_flip);
-            cudaDeviceSynchronize();
-            // printf("launch slice_patch done!\n");
             rx->cleanup();
-            cudaDeviceSynchronize();
-            // printf("launch second clean done!\n");
         }
 
         // Slice once per pass (instead of each inner iteration) to avoid
         // queue feedback loops that can prevent convergence.
         int done = is_done(rx, edge_status.get(), d_buffer);
-        // const uint32_t vertices_after = rx->get_num_vertices(true);
-        if (done == 0) {
-            // pass++;
-            // continue;
+        if (done == 0) 
             break;
-        }
         
     }
 
     CHECK_CUDA(cudaDeviceSynchronize(), false);
 
-
-    LaunchBox<blockThreads> lb_print_flip;
-    rx->update_launch_box(
-        {Op::EVDiamond},
-        lb_print_flip,
-        (void*)printf_all_edges<blockThreads>,
-        false,
-        false,
-        false,
-        false);
-    printf_all_edges<blockThreads> <<< lb_print_flip.blocks,
-                       lb_print_flip.num_threads,
-                       lb_print_flip.smem_bytes_dyn>>>(
-        rx->get_context(),
-        *coords,
-        *edge_flip);
-    CHECK_CUDA(cudaDeviceSynchronize(), false);
-
-
+    // LaunchBox<blockThreads> lb_print_flip;
+    // rx->update_launch_box(
+    //     {Op::EVDiamond},
+    //     lb_print_flip,
+    //     (void*)printf_edge_flip<blockThreads>,
+    //     false,
+    //     false,
+    //     false,
+    //     false);
+    // printf_edge_flip<blockThreads> <<< lb_print_flip.blocks,
+    //                    lb_print_flip.num_threads,
+    //                    lb_print_flip.smem_bytes_dyn>>>(
+    //     rx->get_context(),
+    //     *coords,
+    //     *edge_flip);
+    // CHECK_CUDA(cudaDeviceSynchronize(), false);
 
     rx->update_host();
     if (!rx->validate()) { // 一旦需要validate，一定要先update_host
         RXMESH_ERROR("Validation failed after SplitEdges");
     }
     rx->remove_attribute("e:b1:boundary");
-    // rx->remove_attribute("v:b1:boundary");
-    // rx->remove_attribute("e:c1:status");
+    rx->remove_attribute("e:c1:status");
 }
+
+
+
+
+
+
+template <typename T, uint32_t blockThreads>
+__global__ void face_subdivide_flip(
+    rxmesh::Context                context,
+    rxmesh::VertexAttribute<T>     coords,
+    rxmesh::EdgeAttribute<EdgeStatus> edge_status,
+    rxmesh::EdgeAttribute<bool>  edge_flip
+)
+{
+    using namespace rxmesh;
+
+    auto block = cooperative_groups::this_thread_block();
+    ShmemAllocator shrd_alloc;
+
+    CavityManager<blockThreads, CavityOp::E> cavity(
+        block, context, shrd_alloc, false, false);
+
+    if (cavity.patch_id() == INVALID32) {
+        return;
+    }
+
+    Bitmask is_updated(cavity.patch_info().edges_capacity, shrd_alloc);
+    is_updated.reset(block);
+    block.sync();
+
+    Bitmask e_flip(cavity.patch_info().num_edges[0], shrd_alloc);
+    e_flip.reset(block);
+
+    uint32_t shmem_before = shrd_alloc.get_allocated_size_bytes();
+
+    // uint16_t* v_info =
+    //     shrd_alloc.alloc<uint16_t>(2 * cavity.patch_info().num_vertices[0]);
+    // fill_n<blockThreads>(
+    //     v_info, 2 * cavity.patch_info().num_vertices[0], uint16_t(INVALID16));
+
+    // a bitmask that indicates which edge we want to flip
+
+
+    Query<blockThreads> query(context, cavity.patch_id());
+    query.dispatch<Op::EVDiamond>(
+        block,
+        shrd_alloc,
+        [&](const EdgeHandle& eh, const VertexIterator& iter) {
+            if (edge_flip(eh) && edge_status(eh) == UNSEEN) {
+                cavity.create(eh);
+            } else {
+                edge_flip(eh) = false; 
+                edge_status(eh) = SKIP;
+            }
+        });
+    block.sync();
+
+    shrd_alloc.dealloc(shrd_alloc.get_allocated_size_bytes() - shmem_before);
+
+    if (cavity.prologue(block, shrd_alloc, coords, edge_status, edge_flip)) {
+        cavity.for_each_cavity(block, [&](uint16_t c, uint16_t size) {
+            if (size != 4) {
+                return;
+            }
+            DEdgeHandle new_edge = cavity.add_edge(
+                cavity.get_cavity_vertex(c, 1), cavity.get_cavity_vertex(c, 3));
+
+
+            if (new_edge.is_valid()) {
+                is_updated.set(new_edge.local_id(), true);
+                // edge_flip(new_edge.get_edge_handle()) = false; // don't flip the new edge
+                cavity.add_face(cavity.get_cavity_edge(c, 0),
+                                new_edge,
+                                cavity.get_cavity_edge(c, 3));
+
+
+                cavity.add_face(cavity.get_cavity_edge(c, 1),
+                                cavity.get_cavity_edge(c, 2),
+                                new_edge.get_flip_dedge());
+            }
+
+        });
+    }
+    cavity.epilogue(block);
+    block.sync();
+
+    for_each_edge(cavity.patch_info(), [&](EdgeHandle eh) {
+        if (is_updated(eh.local_id())) {
+            edge_status(eh) = ADDED;
+            edge_flip(eh) = false; // don't flip the new edge
+        } 
+    });
+}
+
+
+
 
 void FlipEdges(RXMeshWrapper* wrapper)
 {
@@ -598,21 +541,15 @@ void FlipEdges(RXMeshWrapper* wrapper)
     // The attributes might have been cleaned up by SplitEdges.
     // Instead of forcing removal, allow add_attribute to overwrite if existing.
 
-    auto v_boundary  = rx->add_vertex_attribute<bool>("v:b1:boundary", 1);
     auto edge_status = rx->add_edge_attribute<EdgeStatus>("e:c1:status", 1);
     auto edge_flip =
         std::dynamic_pointer_cast<EdgeAttribute<bool>>(
             wrapper->m_attributes["e:b1:flip"]);
 
-    // wrapper->m_attributes["v:b1:boundary"] = v_boundary;
     // wrapper->m_attributes["e:c1:status"] = edge_status;
 
     edge_status->reset(UNSEEN, DEVICE);
     
-    // rx->update_host();
-
-    rx->get_boundary_vertices(*v_boundary);
-    // get_boundary_vertices(wrapper, *v_boundary);
 
     constexpr uint32_t blockThreads = 256;
 
@@ -630,9 +567,8 @@ void FlipEdges(RXMeshWrapper* wrapper)
         false,
         false,
         [&](uint32_t v, uint32_t e, uint32_t) {
-               return 3 * rxmesh::detail::mask_num_bytes(e) +
-                 sizeof(uint16_t) * 2 * v +
-                 4 * ShmemAllocator::default_alignment;
+               return 2 * rxmesh::detail::mask_num_bytes(e) +
+                 2 * ShmemAllocator::default_alignment;
         });
 
     constexpr int kMaxFlipPasses = 8;
@@ -654,18 +590,15 @@ void FlipEdges(RXMeshWrapper* wrapper)
                     rx->get_context(),
                     *coords,
                     *edge_status,
-                    *edge_flip,
-                    d_buffer);
+                    *edge_flip);
 
             rx->cleanup();
             rx->slice_patches(*coords, *edge_status, *edge_flip);
             rx->cleanup();
         }
 
-        // int remaining_work = is_done(rx, edge_status.get(), d_buffer);
-        int d = 0;
-        cudaMemcpy(&d, d_buffer, sizeof(int), cudaMemcpyDeviceToHost);
-        int remaining_work = d;
+        int remaining_work = is_done(rx, edge_status.get(), d_buffer);
+        
         if (remaining_work == 0 || prv_remaining_work == remaining_work) {
             // printf("[Flip] stop at pass %d as remaining work = %d\n", pass, remaining_work);
             break;
@@ -676,7 +609,9 @@ void FlipEdges(RXMeshWrapper* wrapper)
     CHECK_CUDA(cudaDeviceSynchronize(), false);
 
     rx->update_host();
-
+    if (!rx->validate()) {
+        RXMESH_ERROR("Validation failed after FlipEdges");
+    }
     wrapper->remove_attribute("e:c1:status", false);
     // wrapper->remove_attribute("v:b1:boundary", false);
     CUDA_ERROR(cudaFree(d_buffer));
