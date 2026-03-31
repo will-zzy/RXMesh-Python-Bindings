@@ -1,0 +1,32 @@
+cmake_minimum_required(VERSION 3.20)
+project(MyApp LANGUAGES CXX CUDA)
+if(DEFINED _GLIBCXX_USE_CXX11_ABI)
+    add_compile_definitions(_GLIBCXX_USE_CXX11_ABI=${_GLIBCXX_USE_CXX11_ABI})
+endif()
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CUDA_STANDARD 17)
+# set(CMAKE_CUDA_ARCHITECTURES 86) 
+set(CMAKE_CUDA_ARCHITECTURES 86 CACHE STRING "" FORCE)
+set(CMAKE_CUDA_SEPARABLE_COMPILATION ON)
+
+set(RX_USE_POLYSCOPE OFF CACHE BOOL "" FORCE) 
+set(RX_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(RX_BUILD_APPS  OFF CACHE BOOL "" FORCE)
+set(RX_USE_SUITESPARSE OFF CACHE BOOL "" FORCE)
+set(RX_USE_CUDSS OFF CACHE BOOL "" FORCE)
+set(CMAKE_BUILD_TYPE Debug)
+add_subdirectory(rxmesh) 
+
+# add_executable(my_rxmesh_app src/main_remove_duplicate_faces.cu)
+# add_executable(my_rxmesh_app src/main.cu)
+# target_link_libraries(my_rxmesh_app PRIVATE RXMesh glm::glm)
+include_directories("rxmesh/include")
+include_directories("rxmesh")
+# target_link_libraries(my_rxmesh_app PRIVATE CUDA::cusparse CUDA::cusolver Eigen3::Eigen)
+include(FetchContent)
+FetchContent_GetProperties(openmesh)
+# target_include_directories(my_rxmesh_app PRIVATE
+#     ${openmesh_SOURCE_DIR}/src
+# )
+
+add_subdirectory(rxmesh_binding)
